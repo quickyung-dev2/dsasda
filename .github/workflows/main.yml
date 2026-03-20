@@ -3,7 +3,7 @@ name: UltraViewer KeepAlive - Display ID & PASS in Logs
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # fallback, nhưng loop sẽ giữ chạy mãi
+    - cron: '0 */6 * * *'  # fallback
 
 concurrency:
   group: ultraviewer-keepalive
@@ -14,11 +14,11 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        instance: [1]  # tăng [1..20] nếu muốn nhiều parallel
+        instance: [1]  # chỉnh [1..20] nếu muốn parallel
       max-parallel: 20
       fail-fast: false
 
-    timeout-minutes: 0  # vô hạn
+    timeout-minutes: 0
 
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +38,6 @@ jobs:
         run: |
           $exe = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
           if (-Not (Test-Path $exe)) { $exe = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
-
           if (-Not (Test-Path $exe)) {
             Write-Output "Installing UltraViewer..."
             Invoke-WebRequest "https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe" -OutFile ultra.exe
@@ -52,45 +51,51 @@ jobs:
         run: |
           $exe = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
           if (-Not (Test-Path $exe)) { $exe = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
-
           if (-Not (Test-Path $exe)) {
             Write-Output "UltraViewer exe not found!"
             exit 1
           }
 
-          $refresh = 21600   # 6 hours
-          $check_every = 600 # 10 minutes
+          $refresh = 21600   # 6h
+          $check_every = 600 # 10p
 
           while ($true) {
             $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
             Write-Output "[$now] Restarting UltraViewer VM-${{ matrix.instance }}"
 
-            # Kill old instances
+            # Kill cũ
             Get-Process | Where-Object { $_.Path -like "*UltraViewer_Desktop.exe*" } | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
 
             Start-Process $exe
-            Start-Sleep -Seconds 200  # chờ load UI (tăng nếu chậm)
+            Start-Sleep -Seconds 240  # chờ load + popup nếu có
 
-            # Extract & display
+            # Extract
             $script = "$env:GITHUB_WORKSPACE\.github\scripts\extract_ultra.py"
             if (Test-Path $script) {
+              Write-Output "Chạy extract..."
               python $script
+              Write-Output "=== Extract Output & Debug ==="
+
               if (Test-Path "extract_debug.log") {
-                Write-Output "=== Extract Debug Log (last 30 lines) ==="
-                Get-Content "extract_debug.log" -Tail 30
+                Write-Output "DEBUG LOG (last 50 lines):"
+                Get-Content "extract_debug.log" -Tail 50
+              }
+              if (Test-Path "ui_dump.txt") {
+                Write-Output "UI DUMP excerpt (đầu):"
+                Get-Content "ui_dump.txt" -TotalCount 60  # ~2000 chars
               }
             } else {
-              Write-Output "Extract script not found!"
+              Write-Output "Script extract không tồn tại!"
             }
 
             Write-Output "----------------------------------------"
 
-            # Hold until next refresh
+            # Hold
             $slept = 0
             while ($slept -lt $refresh) {
               Start-Sleep -Seconds $check_every
               $slept += $check_every
-              Write-Output "Holding... $slept / $refresh seconds elapsed"
+              Write-Output "Holding... $slept / $refresh giây"
             }
           }
