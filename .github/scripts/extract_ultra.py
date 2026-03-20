@@ -1,72 +1,130 @@
-# extract_ultra.py - Extract UltraViewer ID & PASS using pywinauto
+# extract_ultra.py - Fix Unicode + Extract UltraViewer ID & PASS
 import sys
 import time
-from pywinauto import Application, findwindows
-from pywinauto.timings import wait_until_passes
+import re
+from pywinauto import Application
+from pywinauto.findwindows import ElementNotFoundError, WindowAmbiguousError
+
+# Fix UnicodeEncodeError: Force stdout UTF-8
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except AttributeError:
+    # Python < 3.7 fallback
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 def log(msg):
-    print(msg, file=sys.stdout)
-    with open("extract_debug.log", "a", encoding="utf-8") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
+    ts = time.strftime('%Y-%m-%d %H:%M:%S UTC')
+    safe_msg = msg.encode('utf-8', errors='replace').decode('utf-8')  # safe
+    print(f"[{ts}] {safe_msg}")
+    # Append to file (luôn an toàn)
+    with open("extract_debug.log", "a", encoding="utf-8", errors='replace') as f:
+        f.write(f"[{ts}] {safe_msg}\n")
 
-log("Bắt đầu extract UltraViewer ID/PASS")
+log("START: Extract UltraViewer ID & PASS (UTF-8 fixed)")
 
-try:
-    # Thử connect với backend win32 (thường phù hợp UltraViewer)
-    app = Application(backend='win32').connect(title_re=".*UltraViewer.*", timeout=30)
-    log("Connect thành công với backend=win32")
-except findwindows.ElementNotFoundError:
+app = None
+for bk in ['win32', 'uia']:
     try:
-        # Fallback UIA nếu win32 fail
-        app = Application(backend='uia').connect(title_re=".*UltraViewer.*", timeout=30)
-        log("Connect thành công với backend=uia (fallback)")
+        log(f"Thử backend '{bk}' (timeout 60s)")
+        app = Application(backend=bk).connect(title_re=r".*UltraViewer.*", timeout=60)
+        log(f"CONNECTED với '{bk}'")
+        break
     except Exception as e:
-        log(f"Không connect được UltraViewer: {str(e)}")
-        print("UltraViewer_ID: Unknown")
-        print("UltraViewer_Password: Unknown")
-        sys.exit(1)
+        log(f"Backend '{bk}' fail: {str(e)}")
+
+if not app:
+    log("Không connect được UltraViewer!")
+    print("ID: Unknown | PASS: Unknown")
+    sys.exit(0)
 
 try:
-    # Lấy cửa sổ chính (thường title chứa ID)
     dlg = app.top_window()
-    dlg.wait('visible ready', timeout=60)
-    log("Cửa sổ chính UltraViewer đã visible")
+    log("Chờ window visible & ready (90s)")
+    dlg.wait('visible ready enabled', timeout=90)
 
-    # Debug: Dump toàn bộ control tree ra log
-    log("Dump control identifiers:")
-    dlg.print_control_identifiers(file=sys.stdout)  # in ra stdout để xem log Actions
+    title = dlg.window_text() or ""
+    log(f"Window title: {title}")
 
-    # Tìm ID: thường là Static text kiểu "Your ID: 12345678" hoặc Edit readonly
-    id_text = "Unknown"
-    pass_text = "Unknown"
+    # Dump UI tree vào FILE thay vì print trực tiếp (tránh Unicode crash)
+    dump_path = "ui_dump.txt"
+    log(f"Dump UI tree vào file: {dump_path}")
+    with open(dump_path, "w", encoding="utf-8", errors='replace') as f:
+        dlg.print_control_identifiers(file=f, depth=10)
+    # In excerpt nhỏ để log
+    with open(dump_path, "r", encoding="utf-8", errors='replace') as f:
+        excerpt = f.read(2000)  # giới hạn tránh log quá dài
+        print("UI Dump excerpt (first 2000 chars):\n" + excerpt)
 
-    # Cách 1: Tìm control chứa "ID" hoặc số dài 8-10 chữ số
+    id_val = "Unknown"
+    pass_val = "Unknown"
+
+    # Parse từ title
+    id_match = re.search(r'\b\d{9}\b', title)
+    if id_match:
+        id_val = id_match.group(0)
+        log(f"ID từ title: {id_val}")
+
+    # Duyệt controls (Static/Text/Edit)
     for ctrl in dlg.descendants():
-        text = ctrl.window_text().strip()
-        if text and len(text) >= 8 and text.isdigit():  # ID thường là số
-            id_text = text
-            log(f"Tìm thấy ID tiềm năng: {id_text}")
-            break
-        if "ID" in text.upper():
-            id_text = text.split(":", 1)[-1].strip() if ":" in text else text
-            log(f"Tìm thấy text chứa ID: {id_text}")
+        try:
+            text = (ctrl.window_text() or "").strip()
+            if not text:
+                continue
 
-    # Cách 2: Tìm Password (thường "Password: XXXXXX" hoặc random chars)
-    for ctrl in dlg.descendants():
-        text = ctrl.window_text().strip()
-        if "PASS" in text.upper() or (len(text) >= 6 and any(c.isupper() for c in text) and any(c.isdigit() for c in text)):
-            pass_text = text.split(":", 1)[-1].strip() if ":" in text else text
-            log(f"Tìm thấy PASS tiềm năng: {pass_text}")
+            # ID: chính xác 9 số
+            if re.fullmatch(r'\d{9}', text):
+                id_val = text
+                log(f"ID từ control: {text}")
 
-    # Nếu vẫn Unknown, thử OCR fallback (cần pytesseract + pillow, nhưng GitHub Actions chưa install → skip tạm)
-    # Hoặc dùng dlg.child_window(title_re=".*ID.*").window_text()
+            # PASS: 6-8 ký tự mix (thường random)
+            if 6 <= len(text) <= 8 and any(c.isalpha() for c in text) and any(c.isdigit() for c in text):
+                pass_val = text
+                log(f"PASS tiềm năng: {text}")
 
-    print(f"UltraViewer_ID: {id_text}")
-    print(f"UltraViewer_Password: {pass_text}")
+            # Nếu label có "ID" / "Mã" / "Your ID" / "ID của bạn"
+            if re.search(r'(ID|Mã|Your ID|ID của bạn)', text, re.I):
+                try:
+                    sib = ctrl.next_sibling_control()
+                    if sib:
+                        sib_text = sib.window_text().strip()
+                        if re.fullmatch(r'\d{9}', sib_text):
+                            id_val = sib_text
+                            log(f"ID từ sibling: {sib_text}")
+                except:
+                    pass
+
+            # Label "Password" / "Mật khẩu" / "Pass"
+            if re.search(r'(Password|Mật khẩu|Pass)', text, re.I):
+                try:
+                    sib = ctrl.next_sibling_control()
+                    if sib:
+                        sib_text = sib.window_text().strip()
+                        if 6 <= len(sib_text) <= 8:
+                            pass_val = sib_text
+                            log(f"PASS từ sibling: {sib_text}")
+                except:
+                    pass
+
+    # Fallback từ dump file
+    with open(dump_path, "r", encoding="utf-8", errors='replace') as f:
+        dump_content = f.read()
+    if id_val == "Unknown":
+        m = re.search(r'\b\d{9}\b', dump_content)
+        if m:
+            id_val = m.group(0)
+            log(f"ID fallback từ dump: {id_val}")
+    if pass_val == "Unknown":
+        m = re.search(r'\b([A-Za-z0-9]{6,8})\b', dump_content)
+        if m:
+            pass_val = m.group(1)
+            log(f"PASS fallback từ dump: {pass_val}")
+
+    # Kết quả chính
+    print(f"\n=== FINAL ID & PASS ===\nID: {id_val}\nPASS: {pass_val}\n===================\n")
 
 except Exception as e:
-    log(f"Lỗi trong quá trình extract: {str(e)}")
-    print("UltraViewer_ID: Unknown")
-    print("UltraViewer_Password: Unknown")
+    log(f"ERROR extract: {str(e)}")
+    print("ID: Unknown | PASS: Unknown")
 
-log("Kết thúc extract")
+log("END: Extract done")
