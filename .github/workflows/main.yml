@@ -134,8 +134,6 @@ jobs:
 
           $debug = $output.Substring(0,[Math]::Min(3000,$output.Length))
 
-          $msg += "Debug:`n$debug"
-
           $body = @{
             chat_id = $env:CHAT_ID
             text = $msg
