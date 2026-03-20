@@ -1,35 +1,29 @@
-name: UltraViewer KeepAlive - Auto Refresh ID/PASS
+name: UltraViewer KeepAlive - Display ID & PASS in Logs
 
 on:
-  workflow_dispatch:          # vẫn giữ để test/manual start
+  workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'     # fallback trigger, nhưng loop sẽ làm chính
+    - cron: '0 */6 * * *'  # fallback, nhưng loop sẽ giữ chạy mãi
 
 concurrency:
-  group: ultraviewer-keepalive-global
-  cancel-in-progress: false   # queue nếu có run mới, không cancel running
+  group: ultraviewer-keepalive
+  cancel-in-progress: false
 
 jobs:
-  keep-ultraviewer-alive:
+  keep-alive:
     runs-on: windows-2022
     strategy:
       matrix:
-        instance: [1]               # đổi thành [1..20] nếu muốn 20 parallel thật (nhưng tốn minutes)
+        instance: [1]  # tăng [1..20] nếu muốn nhiều parallel
       max-parallel: 20
       fail-fast: false
 
-    timeout-minutes: 0            # chạy mãi không timeout (GitHub cho phép 0 = unlimited, nhưng thực tế max ~35 ngày)
-
-    env:
-      TOKEN: "8416315798:AAGS8j2dQi9Q0qTXpVHMYOJ83ye2Q0wjLNI"
-      CHAT_ID: "6229578354"
-      VM_ID: "VM-${{ matrix.instance }}"
+    timeout-minutes: 0  # vô hạn
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Chocolatey + Python + pywinauto
+      - name: Install Python + pywinauto
         shell: pwsh
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
@@ -38,86 +32,65 @@ jobs:
           refreshenv
           python -m pip install --upgrade pip pywinauto
           python --version
-          Write-Output "Setup hoàn tất trên $env:VM_ID"
 
-      - name: Install or Re-Install UltraViewer
+      - name: Install or Update UltraViewer
         shell: pwsh
         run: |
-          $setupUrl = "https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe"
-          $exePath = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
-          if (-Not (Test-Path $exePath)) { $exePath = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
+          $exe = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
+          if (-Not (Test-Path $exe)) { $exe = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
 
-          if (-Not (Test-Path $exePath)) {
-            Write-Output "Downloading & Installing UltraViewer..."
-            Invoke-WebRequest $setupUrl -OutFile ultra.exe
+          if (-Not (Test-Path $exe)) {
+            Write-Output "Installing UltraViewer..."
+            Invoke-WebRequest "https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe" -OutFile ultra.exe
             Start-Process ultra.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
           } else {
-            Write-Output "UltraViewer đã có, skip install."
+            Write-Output "UltraViewer already installed."
           }
 
-      - name: Main Loop - Keep Alive & Refresh every 6h
+      - name: Loop - Run UltraViewer & Display ID/PASS every 6h
         shell: pwsh
         run: |
-          $exePath = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
-          if (-Not (Test-Path $exePath)) { $exePath = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
+          $exe = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
+          if (-Not (Test-Path $exe)) { $exe = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
 
-          if (-Not (Test-Path $exePath)) {
-            Write-Output "UltraViewer không tìm thấy → exit loop"
+          if (-Not (Test-Path $exe)) {
+            Write-Output "UltraViewer exe not found!"
             exit 1
           }
 
-          $refreshIntervalSeconds = 21600   # 6h
-          $sleepCheckSeconds = 600          # check mỗi 10 phút
+          $refresh = 21600   # 6 hours
+          $check_every = 600 # 10 minutes
 
           while ($true) {
-            Write-Output "[$((Get-Date).ToUniversalTime())] Starting/Restarting UltraViewer on $env:VM_ID"
+            $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+            Write-Output "[$now] Restarting UltraViewer VM-${{ matrix.instance }}"
 
-            # Kill if already running (tránh nhiều instance)
+            # Kill old instances
             Get-Process | Where-Object { $_.Path -like "*UltraViewer_Desktop.exe*" } | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
 
-            Start-Process -FilePath $exePath
-            Start-Sleep -Seconds 150   # chờ UI load
+            Start-Process $exe
+            Start-Sleep -Seconds 200  # chờ load UI (tăng nếu chậm)
 
-            # Extract ID/PASS
-            $scriptPath = "$env:GITHUB_WORKSPACE\.github\scripts\extract_ultra.py"
-            $outputFile = "ultra_output_$env:VM_ID.txt"
-
-            if (Test-Path $scriptPath) {
-              python $scriptPath > $outputFile 2>&1
-              $output = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
+            # Extract & display
+            $script = "$env:GITHUB_WORKSPACE\.github\scripts\extract_ultra.py"
+            if (Test-Path $script) {
+              python $script
+              if (Test-Path "extract_debug.log") {
+                Write-Output "=== Extract Debug Log (last 30 lines) ==="
+                Get-Content "extract_debug.log" -Tail 30
+              }
             } else {
-              $output = "Script extract không tồn tại"
+              Write-Output "Extract script not found!"
             }
 
-            # Parse ID & PASS
-            $id = "Unknown"; $pass = "Unknown"
-            if ($output -match 'UltraViewer_ID:\s*(\S+)') { $id = $matches[1] }
-            if ($output -match 'UltraViewer_Password:\s*(\S+)') { $pass = $matches[1] }
+            Write-Output "----------------------------------------"
 
-            # Build message
-            $msg = "UltraViewer $env:VM_ID / ${{ matrix.instance }}`n"
-            $msg += "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC`n"
-            $msg += "ID: $id`n"
-            $msg += "PASS: $pass`n"
-            $msg += "Debug (3000 chars):`n$($output.Substring(0,[Math]::Min(3000,$output.Length)))"
-
-            # Send Telegram
-            $body = @{ chat_id = $env:CHAT_ID; text = $msg } | ConvertTo-Json -Compress
-            try {
-              Invoke-RestMethod -Uri "https://api.telegram.org/bot$env:TOKEN/sendMessage" `
-                -Method Post -Body $body -ContentType "application/json"
-              Write-Output "Telegram sent OK"
-            } catch {
-              Write-Output "Telegram fail: $($_.Exception.Message)"
-            }
-
-            # Sleep & loop
-            Write-Output "Hold $refreshIntervalSeconds giây (6h) trước khi refresh..."
+            # Hold until next refresh
             $slept = 0
-            while ($slept -lt $refreshIntervalSeconds) {
-              Start-Sleep -Seconds $sleepCheckSeconds
-              $slept += $sleepCheckSeconds
-              Write-Output "Đã hold $slept / $refreshIntervalSeconds giây..."
+            while ($slept -lt $refresh) {
+              Start-Sleep -Seconds $check_every
+              $slept += $check_every
+              Write-Output "Holding... $slept / $refresh seconds elapsed"
             }
           }
