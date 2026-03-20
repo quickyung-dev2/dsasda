@@ -1,168 +1,123 @@
-name: UltraViewer 20 Jobs Parallel + Telegram + KeepAlive
+name: UltraViewer KeepAlive - Auto Refresh ID/PASS
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # vẫn giữ để test/manual start
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */6 * * *'     # fallback trigger, nhưng loop sẽ làm chính
+
+concurrency:
+  group: ultraviewer-keepalive-global
+  cancel-in-progress: false   # queue nếu có run mới, không cancel running
 
 jobs:
-  run-ultraviewer:
+  keep-ultraviewer-alive:
     runs-on: windows-2022
-
     strategy:
       matrix:
-        vm: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+        instance: [1]               # đổi thành [1..20] nếu muốn 20 parallel thật (nhưng tốn minutes)
       max-parallel: 20
       fail-fast: false
+
+    timeout-minutes: 0            # chạy mãi không timeout (GitHub cho phép 0 = unlimited, nhưng thực tế max ~35 ngày)
 
     env:
       TOKEN: "8416315798:AAGS8j2dQi9Q0qTXpVHMYOJ83ye2Q0wjLNI"
       CHAT_ID: "6229578354"
-      VM_ID: "VM-${{ matrix.vm }}"
+      VM_ID: "VM-${{ matrix.instance }}"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-
-      - name: Install Python + pywinauto
+      - name: Install Chocolatey + Python + pywinauto
         shell: pwsh
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           iex ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
           choco install python311 -y --force
-
           refreshenv
-
-          python -m pip install --upgrade pip
-          python -m pip install pywinauto
-
+          python -m pip install --upgrade pip pywinauto
           python --version
-          Write-Output "Python + pywinauto installed on $env:VM_ID"
+          Write-Output "Setup hoàn tất trên $env:VM_ID"
 
-
-      - name: Install UltraViewer
+      - name: Install or Re-Install UltraViewer
         shell: pwsh
         run: |
-          Write-Output "Downloading UltraViewer on $env:VM_ID"
-
-          Invoke-WebRequest https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe -OutFile ultra.exe
-
-          Start-Process ultra.exe `
-            -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" `
-            -Wait
-
-          Write-Output "UltraViewer installed on $env:VM_ID"
-
-
-      - name: Run UltraViewer
-        shell: pwsh
-        run: |
-
+          $setupUrl = "https://www.ultraviewer.net/vi/UltraViewer_setup_6.6_vi.exe"
           $exePath = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
+          if (-Not (Test-Path $exePath)) { $exePath = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
 
           if (-Not (Test-Path $exePath)) {
-            $exePath = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe"
+            Write-Output "Downloading & Installing UltraViewer..."
+            Invoke-WebRequest $setupUrl -OutFile ultra.exe
+            Start-Process ultra.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
+          } else {
+            Write-Output "UltraViewer đã có, skip install."
           }
 
-          if (Test-Path $exePath) {
+      - name: Main Loop - Keep Alive & Refresh every 6h
+        shell: pwsh
+        run: |
+          $exePath = "${env:ProgramFiles(x86)}\UltraViewer\UltraViewer_Desktop.exe"
+          if (-Not (Test-Path $exePath)) { $exePath = "$env:ProgramFiles\UltraViewer\UltraViewer_Desktop.exe" }
 
-            Write-Output "Starting UltraViewer on $env:VM_ID"
+          if (-Not (Test-Path $exePath)) {
+            Write-Output "UltraViewer không tìm thấy → exit loop"
+            exit 1
+          }
+
+          $refreshIntervalSeconds = 21600   # 6h
+          $sleepCheckSeconds = 600          # check mỗi 10 phút
+
+          while ($true) {
+            Write-Output "[$((Get-Date).ToUniversalTime())] Starting/Restarting UltraViewer on $env:VM_ID"
+
+            # Kill if already running (tránh nhiều instance)
+            Get-Process | Where-Object { $_.Path -like "*UltraViewer_Desktop.exe*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
 
             Start-Process -FilePath $exePath
+            Start-Sleep -Seconds 150   # chờ UI load
 
-            Start-Sleep -Seconds 150
+            # Extract ID/PASS
+            $scriptPath = "$env:GITHUB_WORKSPACE\.github\scripts\extract_ultra.py"
+            $outputFile = "ultra_output_$env:VM_ID.txt"
 
+            if (Test-Path $scriptPath) {
+              python $scriptPath > $outputFile 2>&1
+              $output = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
+            } else {
+              $output = "Script extract không tồn tại"
+            }
+
+            # Parse ID & PASS
+            $id = "Unknown"; $pass = "Unknown"
+            if ($output -match 'UltraViewer_ID:\s*(\S+)') { $id = $matches[1] }
+            if ($output -match 'UltraViewer_Password:\s*(\S+)') { $pass = $matches[1] }
+
+            # Build message
+            $msg = "UltraViewer $env:VM_ID / ${{ matrix.instance }}`n"
+            $msg += "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC`n"
+            $msg += "ID: $id`n"
+            $msg += "PASS: $pass`n"
+            $msg += "Debug (3000 chars):`n$($output.Substring(0,[Math]::Min(3000,$output.Length)))"
+
+            # Send Telegram
+            $body = @{ chat_id = $env:CHAT_ID; text = $msg } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Uri "https://api.telegram.org/bot$env:TOKEN/sendMessage" `
+                -Method Post -Body $body -ContentType "application/json"
+              Write-Output "Telegram sent OK"
+            } catch {
+              Write-Output "Telegram fail: $($_.Exception.Message)"
+            }
+
+            # Sleep & loop
+            Write-Output "Hold $refreshIntervalSeconds giây (6h) trước khi refresh..."
+            $slept = 0
+            while ($slept -lt $refreshIntervalSeconds) {
+              Start-Sleep -Seconds $sleepCheckSeconds
+              $slept += $sleepCheckSeconds
+              Write-Output "Đã hold $slept / $refreshIntervalSeconds giây..."
+            }
           }
-          else {
-
-            Write-Output "UltraViewer not found on $env:VM_ID"
-
-          }
-
-
-      - name: Extract ID PASS
-        shell: pwsh
-        run: |
-
-          $scriptPath = "$env:GITHUB_WORKSPACE\.github\scripts\extract_ultra.py"
-          $outputFile = "ultra_output_$env:VM_ID.txt"
-
-          if (Test-Path $scriptPath) {
-
-            python $scriptPath > $outputFile 2>&1
-
-            Get-Content $outputFile
-
-          }
-          else {
-
-            "Script not found on $env:VM_ID" | Out-File $outputFile
-
-          }
-
-
-      - name: Send Telegram
-        shell: pwsh
-        run: |
-
-          $outputFile = "ultra_output_$env:VM_ID.txt"
-
-          $output = Get-Content $outputFile -Raw -ErrorAction SilentlyContinue
-
-          if (-not $output) {
-            $output = "No output on $env:VM_ID"
-          }
-
-          $id = "Unknown"
-          $pass = "Unknown"
-
-          if ($output -match 'UltraViewer_ID:\s*(\S+)') {
-            $id = $matches[1]
-          }
-
-          if ($output -match 'UltraViewer_Password:\s*(\S+)') {
-            $pass = $matches[1]
-          }
-
-          $msg = "UltraViewer $env:VM_ID / 20`n"
-          $msg += "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC`n"
-          $msg += "ID: $id`n"
-          $msg += "PASS: $pass`n`n"
-
-          $debug = $output.Substring(0,[Math]::Min(3000,$output.Length))
-
-          $msg += "Debug:`n$debug"
-
-          $body = @{
-            chat_id = $env:CHAT_ID
-            text = $msg
-          }
-
-          $json = $body | ConvertTo-Json -Compress
-
-          try {
-
-            Invoke-RestMethod `
-              -Uri "https://api.telegram.org/bot$env:TOKEN/sendMessage" `
-              -Method Post `
-              -Body $json `
-              -ContentType "application/json"
-
-            Write-Output "Telegram sent for $env:VM_ID"
-
-          }
-          catch {
-
-            Write-Output "Telegram error for $env:VM_ID : $($_.Exception.Message)"
-
-          }
-
-
-      - name: Hold 6 hours
-        shell: pwsh
-        run: |
-          Write-Output "Holding $env:VM_ID for 6 hours..."
-          Start-Sleep -Seconds 21600
-          Write-Output "$env:VM_ID finished"
