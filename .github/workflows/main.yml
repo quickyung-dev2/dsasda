@@ -1,5 +1,5 @@
 
-name: UltraViewer 20 Jobs Parallel + Telegram + KeepAlive
+aname: UltraViewer 20 Jobs Parallel + Telegram + KeepAlive
 
 on:
   workflow_dispatch:
